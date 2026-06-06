@@ -38,6 +38,33 @@ EXAMPLES:
   ctxgen context /path/to/repo -o ai-context.md
 `
 
+const outputDir = "ctxgen-output"
+
+func resolveOutputPath(targetDir, cmd string) (string, error) {
+	folder := filepath.Join(targetDir, outputDir)
+	if err := os.MkdirAll(folder, 0755); err != nil {
+		return "", fmt.Errorf("cannot create output folder %s: %w", folder, err)
+	}
+
+	ext := ".md"
+	if cmd == "pack" {
+		ext = ".txt"
+	}
+
+	next := 1
+	entries, _ := os.ReadDir(folder)
+	for _, e := range entries {
+		var n int
+		fmt.Sscanf(e.Name(), cmd+"-%d"+ext, &n)
+		if n >= next {
+			next = n + 1
+		}
+	}
+
+	filename := fmt.Sprintf("%s-%d%s", cmd, next, ext)
+	return filepath.Join(folder, filename), nil
+}
+
 func main() {
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stderr, usage)
@@ -130,9 +157,18 @@ func main() {
 
 	fmt.Fprintf(os.Stderr, "Found %d files (%d skipped: binary or too large)\n",
 		len(files), skipped)
+	resolvedOutput := *outputPath
+if resolvedOutput == "" {
+    resolvedOutput, err = resolveOutputPath(abs, cmd)
+    if err != nil {
+        fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+        os.Exit(1)
+    }
+}
+
 
 	opts := writer.Options{
-		OutputPath:  *outputPath,
+		OutputPath:  resolvedOutput,
 		Timestamp:   *timestamp,
 		MaxFileSize: *maxSize,
 	}
