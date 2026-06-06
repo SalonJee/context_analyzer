@@ -177,16 +177,12 @@ if resolvedOutput == "" {
 
 	switch cmd {
 	case "pack":
-		if opts.OutputPath == "" {
-			opts.OutputPath = "ctxgen-pack.txt"
-		}
+		
 		fmt.Fprintln(os.Stderr, "Writing pack file...")
 		outPath, err = writer.WritePack(files, contents, opts)
 
 	case "context":
-		if opts.OutputPath == "" {
-			opts.OutputPath = "ctxgen-context.md"
-		}
+		
 		fmt.Fprintln(os.Stderr, "Analyzing repository...")
 		ra := analyzer.Analyze(abs, files, contents)
 		fmt.Fprintf(os.Stderr, "Detected %d languages, %d dependencies, %d routes\n",
@@ -194,9 +190,7 @@ if resolvedOutput == "" {
 		outPath, err = writer.WriteContext(ra, contents, opts)
 
 	case "hybrid":
-		if opts.OutputPath == "" {
-			opts.OutputPath = "ctxgen-hybrid.md"
-		}
+		
 		fmt.Fprintln(os.Stderr, "Analyzing repository...")
 		ra := analyzer.Analyze(abs, files, contents)
 		outPath, err = writer.WriteHybrid(ra, contents, opts)
