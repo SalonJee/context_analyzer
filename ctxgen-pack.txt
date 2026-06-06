@@ -1,0 +1,2586 @@
+=== FILE: README.md ===
+# ctxgen — Repository Context Generator for AI
+
+`ctxgen` is a Go CLI tool that analyzes a software repository and generates a compact, AI-friendly context file. Instead of pasting raw source files into an AI chat (expensive in tokens), `ctxgen` extracts what matters: structure, symbols, routes, schemas, and dependencies — then wraps it in a clean Markdown document.
+
+## Install
+
+```bash
+# Build from source (requires Go 1.21+)
+git clone <repo>
+cd ctxgen
+go build -o ctxgen ./cmd/ctxgen
+
+# Or install globally
+go install ./cmd/ctxgen
+```
+
+## Usage
+
+### Context mode (recommended)
+
+```bash
+ctxgen context .
+```
+
+Generates `ctxgen-context.md` — a compact Markdown summary of the entire repository.
+
+**Example output sections:**
+- Project overview (primary language, frameworks)
+- File tree
+- Language breakdown
+- Dependencies (from `go.mod`, `package.json`, `requirements.txt`, etc.)
+- Entry points
+- Core modules with extracted symbols (functions, structs, classes, interfaces)
+- API routes (REST endpoints detected from code)
+- Database schema (SQL, migrations, ORM models, Prisma)
+- Import relationships
+- Token reduction estimate
+
+### Pack mode
+
+```bash
+ctxgen pack .
+```
+
+Generates `ctxgen-pack.txt` — all source files concatenated into one file with headers. Use when you need full source content.
+
+### Hybrid mode
+
+```bash
+ctxgen hybrid .
+```
+
+Generates `ctxgen-hybrid.md` — the full context summary **plus** inline content of the most important files (entry points, main config, routers, etc.).
+
+## Options
+
+```
+-o <path>         Output file path
+-t                Include timestamp in output header
+-max-size <bytes> Skip files larger than this (default: 500000)
+-v                Show version
+```
+
+## Examples
+
+```bash
+# Analyze current directory, save to custom path
+ctxgen context . -o ai-context.md
+
+# Pack a specific project
+ctxgen pack ~/projects/myapp -o myapp-pack.txt
+
+# Hybrid with timestamp
+ctxgen hybrid . -o context.md -t
+
+# Skip files larger than 100KB
+ctxgen context . -max-size 100000
+```
+
+## What it analyzes
+
+| Feature | Supported |
+|---|---|
+| `.gitignore` respecting | ✓ |
+| Binary file detection | ✓ |
+| Language detection | 40+ languages |
+| **Symbol extraction** | Go, Python, TypeScript, JavaScript, Java, C#, Rust, PHP, Ruby |
+| **Dependency parsing** | go.mod, package.json, requirements.txt, Cargo.toml, pom.xml, build.gradle, pyproject.toml, composer.json, Gemfile |
+| **Route detection** | Gin, Echo, Express, Flask, Django, Spring, ASP.NET |
+| **Schema detection** | SQL CREATE TABLE, Rails migrations, GORM structs, Prisma schema, Django models |
+| Framework detection | React, Next.js, Vue, Express, Django, Flask, FastAPI, Spring, Rails, Gin, and more |
+
+## Architecture
+
+```
+ctxgen/
+├── cmd/ctxgen/         # CLI entrypoint
+└── internal/
+    ├── scanner/        # Directory walking, gitignore, language detection
+    ├── parser/         # Symbol extraction, dependency parsing, schema detection
+    ├── analyzer/       # Repository-wide aggregation, module grouping
+    └── writer/         # Markdown/text output formatting
+```
+
+## Token reduction
+
+Running `ctxgen context` on a typical project:
+
+```
+Files processed:  248
+Total source size: 1.6 MB
+Original estimate: ~420k tokens
+Context output:   ~8.9k tokens
+Estimated reduction: 97.9%
+```
+
+The goal is not compression — it's **repository intelligence extraction**: surfacing the information an AI needs to understand a codebase with far fewer tokens than raw source.
+
+## Ignored by default
+
+- `node_modules/`, `dist/`, `build/`, `target/`, `vendor/`, `.git/`
+- `__pycache__/`, `.venv/`, `venv/`, `.cache/`
+- `.next/`, `.nuxt/`, `.svelte-kit/`
+- Binary files (images, archives, executables, compiled files)
+- Files matched by `.gitignore`
+
+
+=== FILE: cmd/ctxgen/main.go ===
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/ctxgen/ctxgen/internal/analyzer"
+	"github.com/ctxgen/ctxgen/internal/scanner"
+	"github.com/ctxgen/ctxgen/internal/writer"
+)
+
+const version = "1.0.0"
+
+const usage = `ctxgen - Repository Context Generator for AI
+
+USAGE:
+  ctxgen <command> [options] <directory>
+
+COMMANDS:
+  pack      Generate a single text file with all source files concatenated
+  context   Generate a compact Markdown summary (recommended)
+  hybrid    Generate context summary + full contents of key files
+
+OPTIONS:
+  -o <path>         Output file path (default: ctxgen-pack.txt / ctxgen-context.md / ctxgen-hybrid.md)
+  -t                Include timestamp in output
+  -max-size <bytes> Skip files larger than this size (default: 500000)
+  -v                Show version
+
+EXAMPLES:
+  ctxgen context .
+  ctxgen pack ./myproject -o output.txt
+  ctxgen hybrid . -o context.md -t
+  ctxgen context /path/to/repo -o ai-context.md
+`
+
+func main() {
+	if len(os.Args) < 2 {
+		fmt.Fprint(os.Stderr, usage)
+		os.Exit(1)
+	}
+
+	cmd := os.Args[1]
+	if cmd == "-v" || cmd == "--version" || cmd == "version" {
+		fmt.Printf("ctxgen version %s\n", version)
+		os.Exit(0)
+	}
+	if cmd == "-h" || cmd == "--help" || cmd == "help" {
+		fmt.Print(usage)
+		os.Exit(0)
+	}
+
+	switch cmd {
+	case "pack", "context", "hybrid":
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown command: %s\nRun 'ctxgen help' for usage.\n", cmd)
+		os.Exit(1)
+	}
+
+	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
+	outputPath := fs.String("o", "", "Output file path")
+	timestamp := fs.Bool("t", false, "Include timestamp in output")
+	maxSize := fs.Int64("max-size", 500000, "Maximum file size in bytes")
+	_ = fs.Bool("v", false, "Show version") // consumed above
+
+	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
+	if err := fs.Parse(os.Args[2:]); err != nil {
+		os.Exit(1)
+	}
+
+	dir := "."
+	if fs.NArg() > 0 {
+		dir = fs.Arg(0)
+	}
+
+	// Validate directory
+	info, err := os.Stat(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot access directory '%s': %v\n", dir, err)
+		os.Exit(1)
+	}
+	if !info.IsDir() {
+		fmt.Fprintf(os.Stderr, "Error: '%s' is not a directory\n", dir)
+		os.Exit(1)
+	}
+
+	abs, err := filepath.Abs(dir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error resolving path: %v\n", err)
+		os.Exit(1)
+	}
+
+	start := time.Now()
+	fmt.Fprintf(os.Stderr, "ctxgen %s: scanning %s...\n", cmd, abs)
+
+	// Scan
+	s, err := scanner.New(abs)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error creating scanner: %v\n", err)
+		os.Exit(1)
+	}
+
+	files, err := s.Walk()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error scanning directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Read file contents
+	contents := make(map[string]string, len(files))
+	skipped := 0
+	for _, f := range files {
+		if f.IsBinary {
+			continue
+		}
+		if *maxSize > 0 && f.Size > *maxSize {
+			skipped++
+			continue
+		}
+		content, err := scanner.ReadFile(f.Path)
+		if err != nil {
+			continue
+		}
+		contents[f.RelPath] = content
+	}
+
+	fmt.Fprintf(os.Stderr, "Found %d files (%d skipped: binary or too large)\n",
+		len(files), skipped)
+
+	opts := writer.Options{
+		OutputPath:  *outputPath,
+		Timestamp:   *timestamp,
+		MaxFileSize: *maxSize,
+	}
+
+	var outPath string
+
+	switch cmd {
+	case "pack":
+		if opts.OutputPath == "" {
+			opts.OutputPath = "ctxgen-pack.txt"
+		}
+		fmt.Fprintln(os.Stderr, "Writing pack file...")
+		outPath, err = writer.WritePack(files, contents, opts)
+
+	case "context":
+		if opts.OutputPath == "" {
+			opts.OutputPath = "ctxgen-context.md"
+		}
+		fmt.Fprintln(os.Stderr, "Analyzing repository...")
+		ra := analyzer.Analyze(abs, files, contents)
+		fmt.Fprintf(os.Stderr, "Detected %d languages, %d dependencies, %d routes\n",
+			len(ra.Languages), len(ra.Dependencies), len(ra.AllRoutes))
+		outPath, err = writer.WriteContext(ra, contents, opts)
+
+	case "hybrid":
+		if opts.OutputPath == "" {
+			opts.OutputPath = "ctxgen-hybrid.md"
+		}
+		fmt.Fprintln(os.Stderr, "Analyzing repository...")
+		ra := analyzer.Analyze(abs, files, contents)
+		outPath, err = writer.WriteHybrid(ra, contents, opts)
+	}
+
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing output: %v\n", err)
+		os.Exit(1)
+	}
+
+	elapsed := time.Since(start).Round(time.Millisecond)
+
+	// Print summary
+	outputInfo, _ := os.Stat(outPath)
+	outputSize := int64(0)
+	if outputInfo != nil {
+		outputSize = outputInfo.Size()
+	}
+
+	fmt.Fprintln(os.Stderr, strings.Repeat("─", 50))
+	fmt.Fprintf(os.Stderr, "✓ Done in %s\n", elapsed)
+	fmt.Fprintf(os.Stderr, "  Output:  %s\n", outPath)
+	fmt.Fprintf(os.Stderr, "  Size:    %s\n", humanSize(outputSize))
+	fmt.Fprintf(os.Stderr, "  ~Tokens: %d\n", int(float64(outputSize)*0.25))
+}
+
+func humanSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+
+=== FILE: ctxgen-context.md ===
+# Project Context
+
+
+## Overview
+
+This repository is primarily **Go** with 2 other languages.
+Entry points: `cmd/ctxgen/main.go`.
+
+
+## File Tree
+
+```
+.
+├── cmd/
+│   └── ctxgen/
+│       └── main.go
+├── internal/
+│   ├── analyzer/
+│   │   └── analyzer.go
+│   ├── parser/
+│   │   ├── deps.go
+│   │   ├── parser.go
+│   │   └── schema.go
+│   ├── scanner/
+│   │   ├── language.go
+│   │   └── scanner.go
+│   └── writer/
+│       └── writer.go
+├── README.md
+└── go.mod
+```
+
+
+## Languages
+
+- **Go**: 8 files
+- **Go Module**: 1 files
+- **Markdown**: 1 files
+
+
+## Entry Points
+
+- `cmd/ctxgen/main.go`
+
+
+## Configuration Files
+
+- `go.mod`
+
+
+## Core Modules
+
+### cmd/ctxgen
+
+**`cmd/ctxgen/main.go`** (Go)
+  - *funcs*: `main()`, `humanSize(bytes int64) string`
+
+### internal/analyzer
+
+**`internal/analyzer/analyzer.go`** (Go)
+  - *structs*: `RepoAnalysis`, `Module`, `ModuleFile`, `RouteEntry`, `node`, `LangCount`
+  - *funcs*: `Analyze(root string, files []scanner.FileInfo, contents map[string]string) *RepoAnalysis`, `isEntryPoint(relPath, language string) bool`, `buildFileTree(files []scanner.FileInfo, root string) string`
+  - *methods*: `RepoAnalysis.TopLanguages() []LangCount`, `RepoAnalysis.DetectFrameworks() []string`, `RepoAnalysis.ImportantFiles() []scanner.FileInfo`
+
+### internal/parser
+
+**`internal/parser/deps.go`** (Go)
+  - *structs*: `Dependency`
+  - *funcs*: `ParseDependencies(relPath, content string) []Dependency`, `parseGoMod(content string) []Dependency`, `parsePackageJSON(content string) []Dependency`, `parseRequirements(content string) []Dependency`, `parseCargoToml(content string) []Dependency`, `parsePyproject(content string) []Dependency`, `parseComposerJSON(content string) []Dependency`, `parsePomXML(content string) []Dependency`, `extractXMLTag(line, tag string) string`, `parseGradle(content string) []Dependency`, `parseGemfile(content string) []Dependency`
+
+**`internal/parser/parser.go`** (Go)
+  - *structs*: `Symbol`, `FileAnalysis`, `Route`
+  - *funcs*: `Parse(relPath, language, content string) *FileAnalysis`, `parseGo(fa *FileAnalysis, content string)`, `parsePython(fa *FileAnalysis, content string)`, `parseTypeScript(fa *FileAnalysis, content string)`, `parseJava(fa *FileAnalysis, content string)`, `parseCSharp(fa *FileAnalysis, content string)`, `parseRust(fa *FileAnalysis, content string)`, `parsePHP(fa *FileAnalysis, content string)`, `parseRuby(fa *FileAnalysis, content string)`, `parseGeneric(fa *FileAnalysis, content string)`, `extractRoutes(content, relPath string) []Route`, `inferMethodFromContext(line string) string`, `extractSummaryComment(content string) string`
+
+**`internal/parser/schema.go`** (Go)
+  - *structs*: `SchemaInfo`, `TableInfo`
+  - *funcs*: `ExtractSchema(relPath, language, content string) *SchemaInfo`, `parseSQLSchema(content string) []TableInfo`, `parseRailsMigration(content string) []TableInfo`, `parseGoStructSchema(content string) []TableInfo`, `parsePrismaSchema(content string) []TableInfo`, `parseDjangoModels(content string) []TableInfo`
+
+### internal/scanner
+
+**`internal/scanner/language.go`** (Go)
+  > DetectLanguage maps file extensions/names to language names
+  - *funcs*: `DetectLanguage(name, ext string) string`
+
+**`internal/scanner/scanner.go`** (Go)
+  - *structs*: `FileInfo`, `Scanner`, `ignoreRule`
+  - *funcs*: `New(root string) (*Scanner, error)`, `isBinaryFile(path string) bool`, `ReadFile(path string) (string, error)`
+  - *methods*: `Scanner.loadGitignore(dir string)`, `Scanner.isIgnoredByGitignore(relPath string, isDir bool) bool`, `Scanner.Walk() ([]FileInfo, error)`
+
+### internal/writer
+
+**`internal/writer/writer.go`** (Go)
+  - *structs*: `Options`, `mdWriter`
+  - *funcs*: `WritePack(files []scanner.FileInfo, contents map[string]string, opts Options) (string, error)`, `WriteContext(ra *analyzer.RepoAnalysis, contents map[string]string, opts Options) (string, error)`, `WriteHybrid(ra *analyzer.RepoAnalysis, contents map[string]string, opts Options) (string, error)`, `humanSize(bytes int64) string`, `humanNum(n int) string`, `EstimateTokens(s string) int`
+  - *methods*: `mdWriter.write(s string)`, `mdWriter.line(s string)`, `mdWriter.nl()`, `mdWriter.h1(s string)`, `mdWriter.h2(s string)`, `mdWriter.h3(s string)`, `mdWriter.code(lang, content string)`
+
+
+## API Routes
+
+- `GET /path` — `internal/parser/parser.go`
+- `/PATH 'GET'` — `internal/parser/parser.go`
+- `GET route/` — `internal/parser/parser.go`
+- `GET path` — `internal/parser/parser.go`
+
+
+## Import Relationships
+
+Key module dependencies (top-level files):
+
+- `cmd/ctxgen/main.go` → `flag`, `fmt`, `os`, `path/filepath`, `strings`, `time`
+- `internal/analyzer/analyzer.go` → `path/filepath`, `sort`, `strings`
+- `internal/parser/deps.go` → `encoding/json`, `path/filepath`, `strings`
+- `internal/parser/parser.go` → `bufio`, `path/filepath`, `regexp`, `strings`
+- `internal/parser/schema.go` → `regexp`, `strings`
+- `internal/scanner/language.go` → `strings`
+- `internal/scanner/scanner.go` → `bufio`, `os`, `path/filepath`, `sort`, `strings`, `unicode`
+- `internal/writer/writer.go` → `fmt`, `os`, `path/filepath`, `sort`, `strings`, `time`, `unicode/utf8`
+
+
+## Notes
+
+- 1 binary/non-text files were excluded from analysis.
+
+
+## Token Estimate
+
+```
+Files processed:  11
+Total source size: 64.3 KB
+Original estimate: ~16k tokens
+Context output:   ~1k tokens
+Estimated reduction: 91.8%
+```
+
+
+
+=== FILE: go.mod ===
+module github.com/ctxgen/ctxgen
+
+go 1.22.2
+
+
+=== FILE: internal/analyzer/analyzer.go ===
+package analyzer
+
+import (
+	"path/filepath"
+	"sort"
+	"strings"
+
+	"github.com/ctxgen/ctxgen/internal/parser"
+	"github.com/ctxgen/ctxgen/internal/scanner"
+)
+
+// RepoAnalysis is the complete analysis of a repository
+type RepoAnalysis struct {
+	Root         string
+	Files        []scanner.FileInfo
+	Languages    map[string]int   // language -> file count
+	TotalSize    int64
+	TotalChars   int64
+	Dependencies []parser.Dependency
+	FileTree     string
+	Modules      []Module
+	EntryPoints  []string
+	AllRoutes    []RouteEntry
+	AllSchemas   []parser.SchemaInfo
+	ImportGraph  map[string][]string
+	ConfigFiles  []string
+	IgnoredCount int
+}
+
+// Module represents a logical grouping of related files
+type Module struct {
+	Name    string
+	Path    string
+	Files   []ModuleFile
+	IsEntry bool
+}
+
+// ModuleFile is a file within a module with its analysis
+type ModuleFile struct {
+	RelPath  string
+	Language string
+	Symbols  []parser.Symbol
+	Imports  []string
+	Summary  string
+}
+
+// RouteEntry is a route with its source file
+type RouteEntry struct {
+	parser.Route
+	File string
+}
+
+// Analyze builds the full repository analysis
+func Analyze(root string, files []scanner.FileInfo, contents map[string]string) *RepoAnalysis {
+	ra := &RepoAnalysis{
+		Root:      root,
+		Files:     files,
+		Languages: make(map[string]int),
+		ImportGraph: make(map[string][]string),
+	}
+
+	// Config/manifest file names
+	manifestNames := map[string]bool{
+		"go.mod": true, "go.sum": true,
+		"package.json": true, "package-lock.json": true, "yarn.lock": true,
+		"requirements.txt": true, "Pipfile": true, "pyproject.toml": true,
+		"Cargo.toml": true,
+		"pom.xml": true, "build.gradle": true,
+		"composer.json": true,
+		"Makefile": true, "makefile": true,
+		"Dockerfile": true,
+		".gitignore": true,
+		"docker-compose.yml": true, "docker-compose.yaml": true,
+		".env.example": true,
+	}
+
+	moduleMap := make(map[string]*Module)
+
+	for _, f := range files {
+		if f.IsBinary {
+			ra.IgnoredCount++
+			continue
+		}
+
+		ra.Languages[f.Language]++
+		ra.TotalSize += f.Size
+
+		content := contents[f.RelPath]
+		ra.TotalChars += int64(len(content))
+
+		// Config file detection
+		base := filepath.Base(f.RelPath)
+		if manifestNames[base] {
+			ra.ConfigFiles = append(ra.ConfigFiles, f.RelPath)
+		}
+
+		// Entry point detection
+		if isEntryPoint(f.RelPath, f.Language) {
+			ra.EntryPoints = append(ra.EntryPoints, f.RelPath)
+		}
+
+		// Parse dependencies from manifests
+		if manifestNames[base] && content != "" {
+			deps := parser.ParseDependencies(f.RelPath, content)
+			ra.Dependencies = append(ra.Dependencies, deps...)
+		}
+
+		// Parse file symbols
+		if content != "" && !f.IsBinary {
+			fa := parser.Parse(f.RelPath, f.Language, content)
+
+			// Schema extraction
+			schema := parser.ExtractSchema(f.RelPath, f.Language, content)
+			if len(schema.Tables) > 0 {
+				ra.AllSchemas = append(ra.AllSchemas, *schema)
+			}
+
+			// Route collection
+			for _, route := range fa.Routes {
+				ra.AllRoutes = append(ra.AllRoutes, RouteEntry{Route: route, File: f.RelPath})
+			}
+
+			// Import graph
+			if len(fa.Imports) > 0 {
+				ra.ImportGraph[f.RelPath] = fa.Imports
+			}
+
+			// Build module map based on directory
+			dir := filepath.Dir(f.RelPath)
+			if dir == "." {
+				dir = "/"
+			}
+			if _, ok := moduleMap[dir]; !ok {
+				moduleMap[dir] = &Module{
+					Path: dir,
+					Name: filepath.Base(dir),
+				}
+			}
+			mod := moduleMap[dir]
+			mf := ModuleFile{
+				RelPath:  f.RelPath,
+				Language: f.Language,
+				Symbols:  fa.Symbols,
+				Imports:  fa.Imports,
+				Summary:  fa.Summary,
+			}
+			if isEntryPoint(f.RelPath, f.Language) {
+				mod.IsEntry = true
+			}
+			mod.Files = append(mod.Files, mf)
+		}
+	}
+
+	// Sort modules by path depth then name
+	for _, mod := range moduleMap {
+		sort.Slice(mod.Files, func(i, j int) bool {
+			return mod.Files[i].RelPath < mod.Files[j].RelPath
+		})
+		ra.Modules = append(ra.Modules, *mod)
+	}
+	sort.Slice(ra.Modules, func(i, j int) bool {
+		return ra.Modules[i].Path < ra.Modules[j].Path
+	})
+
+	ra.FileTree = buildFileTree(files, root)
+	return ra
+}
+
+func isEntryPoint(relPath, language string) bool {
+	base := filepath.Base(relPath)
+	dir := filepath.Dir(relPath)
+
+	entryFiles := map[string]bool{
+		"main.go": true, "main.py": true, "main.rs": true, "main.ts": true,
+		"main.js": true, "main.tsx": true,
+		"index.ts": true, "index.js": true, "index.tsx": true,
+		"app.ts": true, "app.js": true, "app.tsx": true, "app.py": true,
+		"server.ts": true, "server.js": true,
+		"manage.py": true, "wsgi.py": true, "asgi.py": true,
+		"Program.cs": true,
+	}
+	if !entryFiles[base] {
+		return false
+	}
+	// Prefer root-level or src-level entries
+	depth := strings.Count(relPath, string(filepath.Separator))
+	return depth <= 2 || strings.HasPrefix(dir, "src") || strings.HasPrefix(dir, "cmd")
+}
+
+// buildFileTree generates a tree representation of the files
+func buildFileTree(files []scanner.FileInfo, root string) string {
+	type node struct {
+		name     string
+		children map[string]*node
+		files    []string
+		isDir    bool
+	}
+
+	rootNode := &node{name: ".", children: make(map[string]*node), isDir: true}
+
+	for _, f := range files {
+		if f.IsBinary {
+			continue
+		}
+		parts := strings.Split(f.RelPath, string(filepath.Separator))
+		cur := rootNode
+		for i, part := range parts {
+			if i == len(parts)-1 {
+				cur.files = append(cur.files, part)
+			} else {
+				if _, ok := cur.children[part]; !ok {
+					cur.children[part] = &node{name: part, children: make(map[string]*node), isDir: true}
+				}
+				cur = cur.children[part]
+			}
+		}
+	}
+
+	var sb strings.Builder
+	var walk func(n *node, prefix string, last bool)
+	walk = func(n *node, prefix string, last bool) {
+		// Sort children and files
+		dirs := make([]string, 0, len(n.children))
+		for k := range n.children {
+			dirs = append(dirs, k)
+		}
+		sort.Strings(dirs)
+		sort.Strings(n.files)
+
+		all := make([]string, 0, len(dirs)+len(n.files))
+		all = append(all, dirs...)
+		all = append(all, n.files...)
+
+		for i, name := range all {
+			isLast := i == len(all)-1
+			connector := "├── "
+			if isLast {
+				connector = "└── "
+			}
+			childPrefix := prefix + "│   "
+			if isLast {
+				childPrefix = prefix + "    "
+			}
+
+			if child, ok := n.children[name]; ok {
+				sb.WriteString(prefix + connector + name + "/\n")
+				walk(child, childPrefix, isLast)
+			} else {
+				sb.WriteString(prefix + connector + name + "\n")
+			}
+		}
+	}
+
+	sb.WriteString(".\n")
+	walk(rootNode, "", true)
+	return sb.String()
+}
+
+// TopLanguages returns languages sorted by file count
+func (ra *RepoAnalysis) TopLanguages() []LangCount {
+	var langs []LangCount
+	for lang, count := range ra.Languages {
+		langs = append(langs, LangCount{Language: lang, Count: count})
+	}
+	sort.Slice(langs, func(i, j int) bool {
+		if langs[i].Count != langs[j].Count {
+			return langs[i].Count > langs[j].Count
+		}
+		return langs[i].Language < langs[j].Language
+	})
+	return langs
+}
+
+// LangCount is a language with file count
+type LangCount struct {
+	Language string
+	Count    int
+}
+
+// DetectFrameworks infers frameworks from dependencies and file patterns
+func (ra *RepoAnalysis) DetectFrameworks() []string {
+	fwMap := map[string]string{
+		// Go
+		"github.com/gin-gonic/gin": "Gin (Go)",
+		"github.com/labstack/echo": "Echo (Go)",
+		"github.com/gofiber/fiber": "Fiber (Go)",
+		"github.com/gorilla/mux":   "Gorilla Mux (Go)",
+		"github.com/go-chi/chi":    "Chi (Go)",
+		// JS/TS
+		"react":        "React",
+		"next":         "Next.js",
+		"vue":          "Vue.js",
+		"nuxt":         "Nuxt.js",
+		"angular":      "@angular/core -> Angular",
+		"svelte":       "Svelte",
+		"express":      "Express.js",
+		"fastify":      "Fastify",
+		"nestjs":       "NestJS",
+		"@nestjs/core": "NestJS",
+		"koa":          "Koa.js",
+		// Python
+		"django":      "Django",
+		"flask":       "Flask",
+		"fastapi":     "FastAPI",
+		"tornado":     "Tornado",
+		"starlette":   "Starlette",
+		// Java/Kotlin
+		"springframework": "Spring Framework",
+		"spring-boot":     "Spring Boot",
+		// Rust
+		"actix-web": "Actix Web",
+		"axum":      "Axum",
+		"warp":      "Warp",
+		"rocket":    "Rocket",
+		// PHP
+		"laravel/framework": "Laravel",
+		"symfony/symfony":   "Symfony",
+		// Ruby
+		"rails":  "Ruby on Rails",
+		"sinatra": "Sinatra",
+	}
+
+	seen := make(map[string]bool)
+	var frameworks []string
+
+	for _, dep := range ra.Dependencies {
+		depLower := strings.ToLower(dep.Name)
+		for key, fw := range fwMap {
+			if strings.Contains(depLower, key) && !seen[fw] {
+				seen[fw] = true
+				frameworks = append(frameworks, fw)
+			}
+		}
+	}
+
+	sort.Strings(frameworks)
+	return frameworks
+}
+
+// ImportantFiles returns files that are likely most important
+func (ra *RepoAnalysis) ImportantFiles() []scanner.FileInfo {
+	var result []scanner.FileInfo
+	priority := map[string]int{
+		"main.go": 10, "main.py": 10, "main.rs": 10, "main.ts": 10, "main.js": 10,
+		"app.go": 9, "app.py": 9, "app.ts": 9, "app.js": 9,
+		"server.go": 9, "server.ts": 9, "server.js": 9,
+		"router.go": 8, "routes.go": 8, "router.ts": 8, "routes.ts": 8,
+		"config.go": 7, "config.py": 7, "config.ts": 7,
+		"database.go": 7, "db.go": 7, "models.py": 7,
+		"Dockerfile": 6, "docker-compose.yml": 6, "Makefile": 5,
+		"go.mod": 5, "package.json": 5, "pyproject.toml": 5,
+		"README.md": 4, "readme.md": 4,
+	}
+
+	for _, f := range ra.Files {
+		if f.IsBinary {
+			continue
+		}
+		base := filepath.Base(f.RelPath)
+		if p, ok := priority[base]; ok && p >= 7 {
+			result = append(result, f)
+		}
+	}
+
+	// Limit to top 10
+	if len(result) > 10 {
+		result = result[:10]
+	}
+	return result
+}
+
+
+=== FILE: internal/parser/deps.go ===
+package parser
+
+import (
+	"encoding/json"
+	"path/filepath"
+	"strings"
+)
+
+// Dependency represents a detected project dependency
+type Dependency struct {
+	Name    string
+	Version string
+	Source  string // which manifest file
+}
+
+// ParseDependencies extracts dependencies from known manifest files
+func ParseDependencies(relPath, content string) []Dependency {
+	name := filepath.Base(relPath)
+	switch name {
+	case "go.mod":
+		return parseGoMod(content)
+	case "package.json":
+		return parsePackageJSON(content)
+	case "requirements.txt":
+		return parseRequirements(content)
+	case "Cargo.toml":
+		return parseCargoToml(content)
+	case "pyproject.toml":
+		return parsePyproject(content)
+	case "composer.json":
+		return parseComposerJSON(content)
+	case "pom.xml":
+		return parsePomXML(content)
+	case "build.gradle":
+		return parseGradle(content)
+	case "Gemfile":
+		return parseGemfile(content)
+	}
+	return nil
+}
+
+func parseGoMod(content string) []Dependency {
+	var deps []Dependency
+	lines := strings.Split(content, "\n")
+	inRequire := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "require (" {
+			inRequire = true
+			continue
+		}
+		if inRequire && trimmed == ")" {
+			inRequire = false
+			continue
+		}
+		if inRequire || strings.HasPrefix(trimmed, "require ") {
+			parts := strings.Fields(strings.TrimPrefix(trimmed, "require "))
+			if len(parts) >= 2 && !strings.HasPrefix(parts[0], "//") {
+				version := parts[1]
+				if strings.HasSuffix(version, "// indirect") {
+					continue // skip indirect
+				}
+				deps = append(deps, Dependency{Name: parts[0], Version: version, Source: "go.mod"})
+			}
+		}
+	}
+	return deps
+}
+
+func parsePackageJSON(content string) []Dependency {
+	var pkg struct {
+		Dependencies    map[string]string `json:"dependencies"`
+		DevDependencies map[string]string `json:"devDependencies"`
+	}
+	if err := json.Unmarshal([]byte(content), &pkg); err != nil {
+		return nil
+	}
+	var deps []Dependency
+	for name, ver := range pkg.Dependencies {
+		deps = append(deps, Dependency{Name: name, Version: ver, Source: "package.json"})
+	}
+	// include a few notable devDeps
+	notable := map[string]bool{
+		"typescript": true, "webpack": true, "vite": true, "esbuild": true,
+		"jest": true, "vitest": true, "eslint": true, "prettier": true,
+	}
+	for name, ver := range pkg.DevDependencies {
+		if notable[name] {
+			deps = append(deps, Dependency{Name: name + " (dev)", Version: ver, Source: "package.json"})
+		}
+	}
+	return deps
+}
+
+func parseRequirements(content string) []Dependency {
+	var deps []Dependency
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "-") {
+			continue
+		}
+		// name==version or name>=version or just name
+		for _, sep := range []string{"==", ">=", "<=", "~=", "!="} {
+			if idx := strings.Index(line, sep); idx != -1 {
+				deps = append(deps, Dependency{
+					Name: strings.TrimSpace(line[:idx]),
+					Version: strings.TrimSpace(line[idx:]),
+					Source: "requirements.txt",
+				})
+				goto next
+			}
+		}
+		deps = append(deps, Dependency{Name: line, Source: "requirements.txt"})
+	next:
+	}
+	return deps
+}
+
+func parseCargoToml(content string) []Dependency {
+	var deps []Dependency
+	inDeps := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "[dependencies]" || trimmed == "[dev-dependencies]" {
+			inDeps = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") {
+			inDeps = false
+			continue
+		}
+		if inDeps && trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+			if idx := strings.Index(trimmed, "="); idx != -1 {
+				name := strings.TrimSpace(trimmed[:idx])
+				ver := strings.TrimSpace(trimmed[idx+1:])
+				ver = strings.Trim(ver, `"{}`)
+				deps = append(deps, Dependency{Name: name, Version: ver, Source: "Cargo.toml"})
+			}
+		}
+	}
+	return deps
+}
+
+func parsePyproject(content string) []Dependency {
+	var deps []Dependency
+	inDeps := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "[tool.poetry.dependencies]" || trimmed == "dependencies = [" {
+			inDeps = true
+			continue
+		}
+		if strings.HasPrefix(trimmed, "[") && inDeps {
+			inDeps = false
+			continue
+		}
+		if inDeps && trimmed != "" {
+			line2 := strings.Trim(trimmed, `",[]`)
+			if idx := strings.IndexAny(line2, ">=<~!"); idx != -1 {
+				deps = append(deps, Dependency{Name: strings.TrimSpace(line2[:idx]), Version: strings.TrimSpace(line2[idx:]), Source: "pyproject.toml"})
+			} else if line2 != "" && !strings.HasPrefix(line2, "#") {
+				deps = append(deps, Dependency{Name: line2, Source: "pyproject.toml"})
+			}
+		}
+	}
+	return deps
+}
+
+func parseComposerJSON(content string) []Dependency {
+	var pkg struct {
+		Require map[string]string `json:"require"`
+	}
+	if err := json.Unmarshal([]byte(content), &pkg); err != nil {
+		return nil
+	}
+	var deps []Dependency
+	for name, ver := range pkg.Require {
+		if name == "php" {
+			continue
+		}
+		deps = append(deps, Dependency{Name: name, Version: ver, Source: "composer.json"})
+	}
+	return deps
+}
+
+func parsePomXML(content string) []Dependency {
+	var deps []Dependency
+	lines := strings.Split(content, "\n")
+	var curGroup, curArtifact, curVersion string
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if val := extractXMLTag(trimmed, "groupId"); val != "" {
+			curGroup = val
+		} else if val := extractXMLTag(trimmed, "artifactId"); val != "" {
+			curArtifact = val
+		} else if val := extractXMLTag(trimmed, "version"); val != "" {
+			curVersion = val
+		} else if trimmed == "</dependency>" {
+			if curArtifact != "" {
+				deps = append(deps, Dependency{
+					Name:    curGroup + ":" + curArtifact,
+					Version: curVersion,
+					Source:  "pom.xml",
+				})
+			}
+			curGroup, curArtifact, curVersion = "", "", ""
+		}
+	}
+	return deps
+}
+
+func extractXMLTag(line, tag string) string {
+	open := "<" + tag + ">"
+	close := "</" + tag + ">"
+	if idx := strings.Index(line, open); idx != -1 {
+		start := idx + len(open)
+		if end := strings.Index(line[start:], close); end != -1 {
+			return line[start : start+end]
+		}
+	}
+	return ""
+}
+
+func parseGradle(content string) []Dependency {
+	var deps []Dependency
+	re := strings.NewReplacer("'", "\"")
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(re.Replace(line))
+		for _, prefix := range []string{"implementation ", "api ", "compile ", "testImplementation "} {
+			if strings.HasPrefix(trimmed, prefix) {
+				val := strings.TrimPrefix(trimmed, prefix)
+				val = strings.Trim(val, `"`)
+				parts := strings.Split(val, ":")
+				if len(parts) >= 2 {
+					name := parts[0] + ":" + parts[1]
+					ver := ""
+					if len(parts) >= 3 {
+						ver = parts[2]
+					}
+					deps = append(deps, Dependency{Name: name, Version: ver, Source: "build.gradle"})
+				}
+			}
+		}
+	}
+	return deps
+}
+
+func parseGemfile(content string) []Dependency {
+	re := strings.NewReplacer("'", "\"")
+	var deps []Dependency
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(re.Replace(line))
+		if strings.HasPrefix(trimmed, "gem ") {
+			parts := strings.Split(trimmed[4:], ",")
+			if len(parts) >= 1 {
+				name := strings.Trim(parts[0], `" `)
+				ver := ""
+				if len(parts) >= 2 {
+					ver = strings.Trim(parts[1], `" `)
+				}
+				deps = append(deps, Dependency{Name: name, Version: ver, Source: "Gemfile"})
+			}
+		}
+	}
+	return deps
+}
+
+
+=== FILE: internal/parser/parser.go ===
+package parser
+
+import (
+	"bufio"
+	"path/filepath"
+	"regexp"
+	"strings"
+)
+
+// Symbol represents an extracted code symbol
+type Symbol struct {
+	Kind    string // func, method, class, struct, interface, const, var, type, route
+	Name    string
+	Sig     string // signature or brief context
+	Line    int
+}
+
+// FileAnalysis holds parsed information from a single file
+type FileAnalysis struct {
+	RelPath  string
+	Language string
+	Symbols  []Symbol
+	Imports  []string
+	Routes   []Route
+	Summary  string // first meaningful comment block
+}
+
+// Route represents a detected HTTP route
+type Route struct {
+	Method string
+	Path   string
+	Line   int
+}
+
+// Parse analyzes a file's content based on its language
+func Parse(relPath, language, content string) *FileAnalysis {
+	fa := &FileAnalysis{
+		RelPath:  relPath,
+		Language: language,
+	}
+	fa.Summary = extractSummaryComment(content)
+
+	switch language {
+	case "Go":
+		parseGo(fa, content)
+	case "Python":
+		parsePython(fa, content)
+	case "TypeScript", "TypeScript (TSX)", "JavaScript", "JavaScript (JSX)":
+		parseTypeScript(fa, content)
+	case "Java":
+		parseJava(fa, content)
+	case "C#":
+		parseCSharp(fa, content)
+	case "Rust":
+		parseRust(fa, content)
+	case "PHP":
+		parsePHP(fa, content)
+	case "Ruby":
+		parseRuby(fa, content)
+	default:
+		parseGeneric(fa, content)
+	}
+
+	fa.Routes = append(fa.Routes, extractRoutes(content, relPath)...)
+	return fa
+}
+
+// --- Go parser ---
+var (
+	reFuncGo      = regexp.MustCompile(`^func\s+(\([^)]+\)\s+)?(\w+)\s*(\([^)]*\)[^{]*)`)
+	reTypeGo      = regexp.MustCompile(`^type\s+(\w+)\s+(struct|interface|func|map|\[)`)
+	reImportGo    = regexp.MustCompile(`"([^"]+)"`)
+	reConstGo     = regexp.MustCompile(`^\s*(const|var)\s+(\w+)`)
+)
+
+func parseGo(fa *FileAnalysis, content string) {
+	lines := strings.Split(content, "\n")
+	inImportBlock := false
+	inConstBlock := false
+	_ = inConstBlock
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+
+		if trimmed == "import (" {
+			inImportBlock = true
+			continue
+		}
+		if inImportBlock {
+			if trimmed == ")" {
+				inImportBlock = false
+				continue
+			}
+			if m := reImportGo.FindStringSubmatch(trimmed); m != nil {
+				fa.Imports = append(fa.Imports, m[1])
+			}
+			continue
+		}
+		if strings.HasPrefix(trimmed, "import \"") {
+			if m := reImportGo.FindStringSubmatch(trimmed); m != nil {
+				fa.Imports = append(fa.Imports, m[1])
+			}
+		}
+
+		if m := reFuncGo.FindStringSubmatch(trimmed); m != nil {
+			receiver := strings.TrimSpace(m[1])
+			name := m[2]
+			sig := strings.TrimSpace(m[3])
+			kind := "func"
+			if receiver != "" {
+				kind = "method"
+				receiver = strings.Trim(receiver, "() ")
+				// extract type name
+				parts := strings.Fields(receiver)
+				if len(parts) > 1 {
+					receiver = strings.Trim(parts[len(parts)-1], "*")
+				}
+				fa.Symbols = append(fa.Symbols, Symbol{Kind: kind, Name: receiver + "." + name, Sig: sig, Line: i + 1})
+			} else {
+				fa.Symbols = append(fa.Symbols, Symbol{Kind: kind, Name: name, Sig: sig, Line: i + 1})
+			}
+		} else if m := reTypeGo.FindStringSubmatch(trimmed); m != nil {
+			kind := m[2]
+			if kind == "struct" || kind == "interface" {
+				fa.Symbols = append(fa.Symbols, Symbol{Kind: kind, Name: m[1], Line: i + 1})
+			} else {
+				fa.Symbols = append(fa.Symbols, Symbol{Kind: "type", Name: m[1], Line: i + 1})
+			}
+		}
+	}
+}
+
+// --- Python parser ---
+var (
+	rePyFunc   = regexp.MustCompile(`^(\s*)def\s+(\w+)\s*\(([^)]*)\)`)
+	rePyClass  = regexp.MustCompile(`^class\s+(\w+)`)
+	rePyImport = regexp.MustCompile(`^(?:from\s+(\S+)\s+import|import\s+(\S+))`)
+)
+
+func parsePython(fa *FileAnalysis, content string) {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		if m := rePyFunc.FindStringSubmatch(line); m != nil {
+			indent := len(m[1])
+			kind := "func"
+			if indent > 0 {
+				kind = "method"
+			}
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: kind, Name: m[2], Sig: "(" + m[3] + ")", Line: i + 1})
+		} else if m := rePyClass.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "class", Name: m[1], Line: i + 1})
+		} else if m := rePyImport.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+			if m[1] != "" {
+				fa.Imports = append(fa.Imports, m[1])
+			} else {
+				fa.Imports = append(fa.Imports, m[2])
+			}
+		}
+	}
+}
+
+// --- TypeScript/JavaScript parser ---
+var (
+	reTSFunc      = regexp.MustCompile(`(?:export\s+)?(?:async\s+)?function\s+(\w+)\s*[(<]`)
+	reTSClass     = regexp.MustCompile(`(?:export\s+)?(?:abstract\s+)?class\s+(\w+)`)
+	reTSInterface = regexp.MustCompile(`(?:export\s+)?interface\s+(\w+)`)
+	reTSType      = regexp.MustCompile(`(?:export\s+)?type\s+(\w+)\s*=`)
+	reTSConst     = regexp.MustCompile(`(?:export\s+)?const\s+(\w+)\s*[:=]`)
+	reTSImport    = regexp.MustCompile(`^import\s+.*?from\s+['"]([^'"]+)['"]`)
+	reTSArrow     = regexp.MustCompile(`(?:export\s+)?const\s+(\w+)\s*=\s*(?:async\s+)?\(`)
+)
+
+func parseTypeScript(fa *FileAnalysis, content string) {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if m := reTSImport.FindStringSubmatch(trimmed); m != nil {
+			fa.Imports = append(fa.Imports, m[1])
+			continue
+		}
+		if m := reTSClass.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "class", Name: m[1], Line: i + 1})
+		} else if m := reTSInterface.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "interface", Name: m[1], Line: i + 1})
+		} else if m := reTSType.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "type", Name: m[1], Line: i + 1})
+		} else if m := reTSFunc.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "func", Name: m[1], Line: i + 1})
+		} else if m := reTSArrow.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "func", Name: m[1], Line: i + 1})
+		} else if m := reTSConst.FindStringSubmatch(trimmed); m != nil {
+			// Only capture exported consts as they may be important
+			if strings.HasPrefix(trimmed, "export") {
+				fa.Symbols = append(fa.Symbols, Symbol{Kind: "const", Name: m[1], Line: i + 1})
+			}
+		}
+	}
+}
+
+// --- Java parser ---
+var (
+	reJavaClass  = regexp.MustCompile(`(?:public\s+)?(?:abstract\s+)?(?:final\s+)?class\s+(\w+)`)
+	reJavaIface  = regexp.MustCompile(`(?:public\s+)?interface\s+(\w+)`)
+	reJavaMethod = regexp.MustCompile(`(?:public|private|protected)\s+(?:static\s+)?(?:\w+\s+)+(\w+)\s*\(`)
+	reJavaImport = regexp.MustCompile(`^import\s+([\w.]+);`)
+)
+
+func parseJava(fa *FileAnalysis, content string) {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if m := reJavaImport.FindStringSubmatch(trimmed); m != nil {
+			fa.Imports = append(fa.Imports, m[1])
+		} else if m := reJavaClass.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "class", Name: m[1], Line: i + 1})
+		} else if m := reJavaIface.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "interface", Name: m[1], Line: i + 1})
+		} else if m := reJavaMethod.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "method", Name: m[1], Line: i + 1})
+		}
+	}
+}
+
+// --- C# parser ---
+var (
+	reCsClass  = regexp.MustCompile(`(?:public|private|internal|protected)?\s*(?:abstract|sealed|static)?\s*class\s+(\w+)`)
+	reCsIface  = regexp.MustCompile(`(?:public|private|internal)?\s*interface\s+(\w+)`)
+	reCsMethod = regexp.MustCompile(`(?:public|private|protected|internal)\s+(?:static\s+)?(?:async\s+)?(?:\w+\s+)+(\w+)\s*\(`)
+	reCsUsing  = regexp.MustCompile(`^using\s+([\w.]+);`)
+)
+
+func parseCSharp(fa *FileAnalysis, content string) {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if m := reCsUsing.FindStringSubmatch(trimmed); m != nil {
+			fa.Imports = append(fa.Imports, m[1])
+		} else if m := reCsClass.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "class", Name: m[1], Line: i + 1})
+		} else if m := reCsIface.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "interface", Name: m[1], Line: i + 1})
+		} else if m := reCsMethod.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "method", Name: m[1], Line: i + 1})
+		}
+	}
+}
+
+// --- Rust parser ---
+var (
+	reRustFn     = regexp.MustCompile(`(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+(\w+)`)
+	reRustStruct = regexp.MustCompile(`(?:pub(?:\([^)]*\))?\s+)?struct\s+(\w+)`)
+	reRustEnum   = regexp.MustCompile(`(?:pub(?:\([^)]*\))?\s+)?enum\s+(\w+)`)
+	reRustTrait  = regexp.MustCompile(`(?:pub(?:\([^)]*\))?\s+)?trait\s+(\w+)`)
+	reRustUse    = regexp.MustCompile(`^use\s+([\w:{}*]+);`)
+)
+
+func parseRust(fa *FileAnalysis, content string) {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if m := reRustUse.FindStringSubmatch(trimmed); m != nil {
+			fa.Imports = append(fa.Imports, m[1])
+		} else if m := reRustFn.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "func", Name: m[1], Line: i + 1})
+		} else if m := reRustStruct.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "struct", Name: m[1], Line: i + 1})
+		} else if m := reRustEnum.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "enum", Name: m[1], Line: i + 1})
+		} else if m := reRustTrait.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "trait", Name: m[1], Line: i + 1})
+		}
+	}
+}
+
+// --- PHP parser ---
+var (
+	rePHPClass  = regexp.MustCompile(`(?:abstract\s+)?class\s+(\w+)`)
+	rePHPFunc   = regexp.MustCompile(`(?:public|private|protected)?\s*(?:static\s+)?function\s+(\w+)`)
+	rePHPUse    = regexp.MustCompile(`^use\s+([\w\\]+)`)
+)
+
+func parsePHP(fa *FileAnalysis, content string) {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if m := rePHPUse.FindStringSubmatch(trimmed); m != nil {
+			fa.Imports = append(fa.Imports, m[1])
+		} else if m := rePHPClass.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "class", Name: m[1], Line: i + 1})
+		} else if m := rePHPFunc.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "func", Name: m[1], Line: i + 1})
+		}
+	}
+}
+
+// --- Ruby parser ---
+var (
+	reRubyClass  = regexp.MustCompile(`^class\s+(\w+)`)
+	reRubyModule = regexp.MustCompile(`^module\s+(\w+)`)
+	reRubyDef    = regexp.MustCompile(`^\s*def\s+(\w+)`)
+	reRubyReq    = regexp.MustCompile(`^require(?:_relative)?\s+['"]([^'"]+)['"]`)
+)
+
+func parseRuby(fa *FileAnalysis, content string) {
+	lines := strings.Split(content, "\n")
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if m := reRubyReq.FindStringSubmatch(trimmed); m != nil {
+			fa.Imports = append(fa.Imports, m[1])
+		} else if m := reRubyClass.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "class", Name: m[1], Line: i + 1})
+		} else if m := reRubyModule.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "module", Name: m[1], Line: i + 1})
+		} else if m := reRubyDef.FindStringSubmatch(trimmed); m != nil {
+			fa.Symbols = append(fa.Symbols, Symbol{Kind: "func", Name: m[1], Line: i + 1})
+		}
+	}
+}
+
+// --- Generic fallback ---
+func parseGeneric(fa *FileAnalysis, content string) {
+	// No-op for unsupported languages
+}
+
+// --- Route extraction ---
+var routePatterns = []*regexp.Regexp{
+	// Go: router.GET("/path", handler)
+	regexp.MustCompile(`(?i)(?:router|r|mux|app|e|g)\s*\.\s*(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|Handle|HandleFunc|Any)\s*\(\s*["` + "`" + `]([^"` + "`" + `]+)["` + "`" + `]`),
+	// Express/Fastify: app.get('/path', ...)
+	regexp.MustCompile(`(?i)(?:app|router|server)\s*\.\s*(get|post|put|patch|delete|head|options|use|all)\s*\(\s*['"]([^'"]+)['"]`),
+	// Flask: @app.route('/path', methods=['GET'])
+	regexp.MustCompile(`@\w+\.route\s*\(\s*['"]([^'"]+)['"](?:[^)]*methods\s*=\s*\[([^\]]*)\])?`),
+	// Django: path('route/', view)
+	regexp.MustCompile(`(?:path|re_path|url)\s*\(\s*r?['"]([^'"]+)['"]`),
+	// Spring: @RequestMapping/@GetMapping etc
+	regexp.MustCompile(`@(?:RequestMapping|GetMapping|PostMapping|PutMapping|DeleteMapping|PatchMapping)\s*\(\s*(?:value\s*=\s*)?["']([^"']+)["']`),
+	// ASP.NET: [Route("path")]
+	regexp.MustCompile(`\[(?:Route|HttpGet|HttpPost|HttpPut|HttpDelete|HttpPatch)\s*\(\s*["']([^"']+)["']`),
+}
+
+func extractRoutes(content, relPath string) []Route {
+	var routes []Route
+	lines := strings.Split(content, "\n")
+
+	for i, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		for _, re := range routePatterns {
+			m := re.FindStringSubmatch(trimmed)
+			if m == nil {
+				continue
+			}
+			route := Route{Line: i + 1}
+			if len(m) >= 3 {
+				route.Method = strings.ToUpper(m[1])
+				route.Path = m[2]
+			} else if len(m) >= 2 {
+				route.Path = m[1]
+				route.Method = inferMethodFromContext(trimmed)
+			}
+			if route.Path != "" && !strings.Contains(route.Path, "{{") {
+				routes = append(routes, route)
+			}
+		}
+	}
+	return routes
+}
+
+func inferMethodFromContext(line string) string {
+	lower := strings.ToLower(line)
+	for _, m := range []string{"get", "post", "put", "patch", "delete"} {
+		if strings.Contains(lower, m) {
+			return strings.ToUpper(m)
+		}
+	}
+	return "GET"
+}
+
+// extractSummaryComment grabs the first comment block from a file
+func extractSummaryComment(content string) string {
+	scanner := bufio.NewScanner(strings.NewReader(content))
+	var lines []string
+	inBlock := false
+	count := 0
+
+	for scanner.Scan() && count < 30 {
+		count++
+		line := scanner.Text()
+		trimmed := strings.TrimSpace(line)
+
+		if strings.HasPrefix(trimmed, "//") {
+			text := strings.TrimPrefix(trimmed, "//")
+			text = strings.TrimPrefix(text, " ")
+			if text != "" && !strings.HasPrefix(strings.ToLower(text), "generated") &&
+				!strings.HasPrefix(strings.ToLower(text), "copyright") {
+				lines = append(lines, text)
+				inBlock = true
+			}
+		} else if strings.HasPrefix(trimmed, "/*") {
+			inBlock = true
+		} else if strings.HasSuffix(trimmed, "*/") {
+			inBlock = false
+		} else if inBlock && trimmed != "" && !strings.HasPrefix(trimmed, "*") {
+			break
+		} else if inBlock && strings.HasPrefix(trimmed, "*") {
+			text := strings.TrimPrefix(trimmed, "*")
+			text = strings.TrimSpace(text)
+			if text != "" {
+				lines = append(lines, text)
+			}
+		} else if !inBlock && trimmed != "" && !strings.HasPrefix(trimmed, "#!") &&
+			!strings.HasPrefix(trimmed, "package ") &&
+			!strings.HasPrefix(trimmed, "import ") {
+			break
+		}
+	}
+
+	if len(lines) > 3 {
+		lines = lines[:3]
+	}
+	return strings.Join(lines, " ")
+}
+
+// filepath import needed
+var _ = filepath.Ext
+
+
+=== FILE: internal/parser/schema.go ===
+package parser
+
+import (
+	"regexp"
+	"strings"
+)
+
+// SchemaInfo holds detected database schema information
+type SchemaInfo struct {
+	Tables    []TableInfo
+	Source    string
+}
+
+// TableInfo holds table name and column hints
+type TableInfo struct {
+	Name    string
+	Columns []string
+}
+
+var (
+	reSQLCreate   = regexp.MustCompile(`(?i)CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?["'\x60]?(\w+)["'\x60]?`)
+	reSQLColumn   = regexp.MustCompile(`^\s+["'\x60]?(\w+)["'\x60]?\s+(INTEGER|INT|BIGINT|SMALLINT|SERIAL|TEXT|VARCHAR|CHAR|BOOLEAN|BOOL|FLOAT|DOUBLE|DECIMAL|NUMERIC|DATE|TIME|TIMESTAMP|DATETIME|JSON|JSONB|UUID|BLOB|BYTEA)`)
+	reGoStruct    = regexp.MustCompile(`type\s+(\w+)\s+struct`)
+	reGoField     = regexp.MustCompile(`^\s+(\w+)\s+\w+.*\x60.*(?:db|json|gorm):"([^"]+)"`)
+	reMigration   = regexp.MustCompile(`(?i)(?:create_table|add_column|add_index|change_table)\s+:?(\w+)`)
+	reORMModel    = regexp.MustCompile(`(?i)(?:Model|Table)\s*\(\s*["']?(\w+)["']?`)
+)
+
+// ExtractSchema detects schema information from SQL, migrations, and ORM models
+func ExtractSchema(relPath, language, content string) *SchemaInfo {
+	schema := &SchemaInfo{Source: relPath}
+	ext := strings.ToLower(relPath[strings.LastIndex(relPath, ".")+1:])
+
+	if ext == "sql" || language == "SQL" {
+		schema.Tables = append(schema.Tables, parseSQLSchema(content)...)
+	}
+
+	// Rails/ActiveRecord migrations
+	if language == "Ruby" && strings.Contains(relPath, "migrat") {
+		schema.Tables = append(schema.Tables, parseRailsMigration(content)...)
+	}
+
+	// Go struct with db tags (GORM, sqlx)
+	if language == "Go" {
+		schema.Tables = append(schema.Tables, parseGoStructSchema(content)...)
+	}
+
+	// TypeScript/Prisma schema
+	if ext == "prisma" || strings.Contains(relPath, "schema.prisma") {
+		schema.Tables = append(schema.Tables, parsePrismaSchema(content)...)
+	}
+
+	// Django models.py
+	if language == "Python" && (strings.Contains(relPath, "model") || strings.Contains(relPath, "models")) {
+		schema.Tables = append(schema.Tables, parseDjangoModels(content)...)
+	}
+
+	return schema
+}
+
+func parseSQLSchema(content string) []TableInfo {
+	var tables []TableInfo
+	var current *TableInfo
+	inTable := false
+
+	for _, line := range strings.Split(content, "\n") {
+		if m := reSQLCreate.FindStringSubmatch(line); m != nil {
+			if current != nil {
+				tables = append(tables, *current)
+			}
+			current = &TableInfo{Name: m[1]}
+			inTable = true
+			continue
+		}
+		if inTable && current != nil {
+			if strings.TrimSpace(line) == ");" || strings.TrimSpace(line) == ")," {
+				tables = append(tables, *current)
+				current = nil
+				inTable = false
+				continue
+			}
+			if m := reSQLColumn.FindStringSubmatch(line); m != nil {
+				current.Columns = append(current.Columns, m[1]+" "+strings.ToLower(m[2]))
+			}
+		}
+	}
+	if current != nil {
+		tables = append(tables, *current)
+	}
+	return tables
+}
+
+func parseRailsMigration(content string) []TableInfo {
+	var tables []TableInfo
+	var current *TableInfo
+
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "create_table") {
+			m := regexp.MustCompile(`create_table\s+:?["']?(\w+)["']?`).FindStringSubmatch(trimmed)
+			if m != nil {
+				if current != nil {
+					tables = append(tables, *current)
+				}
+				current = &TableInfo{Name: m[1]}
+			}
+		} else if current != nil {
+			// t.string :field_name
+			if m := regexp.MustCompile(`t\.(\w+)\s+:(\w+)`).FindStringSubmatch(trimmed); m != nil {
+				current.Columns = append(current.Columns, m[2]+" "+m[1])
+			} else if strings.HasPrefix(trimmed, "end") {
+				tables = append(tables, *current)
+				current = nil
+			}
+		}
+	}
+	return tables
+}
+
+func parseGoStructSchema(content string) []TableInfo {
+	var tables []TableInfo
+	var current *TableInfo
+	inStruct := false
+
+	for _, line := range strings.Split(content, "\n") {
+		if m := reGoStruct.FindStringSubmatch(strings.TrimSpace(line)); m != nil {
+			// Only capture structs that look like DB models
+			name := m[1]
+			inStruct = true
+			current = &TableInfo{Name: name}
+			continue
+		}
+		if inStruct && current != nil {
+			trimmed := strings.TrimSpace(line)
+			if trimmed == "}" {
+				if len(current.Columns) > 0 {
+					tables = append(tables, *current)
+				}
+				current = nil
+				inStruct = false
+				continue
+			}
+			// Check for db or gorm tags
+			if m := reGoField.FindStringSubmatch(line); m != nil {
+				colName := strings.Split(m[2], ",")[0]
+				if colName != "" && colName != "-" {
+					current.Columns = append(current.Columns, colName)
+				}
+			}
+		}
+	}
+	return tables
+}
+
+func parsePrismaSchema(content string) []TableInfo {
+	var tables []TableInfo
+	var current *TableInfo
+
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "model ") {
+			parts := strings.Fields(trimmed)
+			if len(parts) >= 2 {
+				current = &TableInfo{Name: parts[1]}
+			}
+		} else if current != nil {
+			if trimmed == "}" {
+				tables = append(tables, *current)
+				current = nil
+				continue
+			}
+			// field_name FieldType
+			parts := strings.Fields(trimmed)
+			if len(parts) >= 2 && !strings.HasPrefix(parts[0], "@@") && !strings.HasPrefix(parts[0], "//") {
+				current.Columns = append(current.Columns, parts[0]+" "+strings.ToLower(parts[1]))
+			}
+		}
+	}
+	return tables
+}
+
+func parseDjangoModels(content string) []TableInfo {
+	var tables []TableInfo
+	var current *TableInfo
+
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		// class MyModel(models.Model):
+		if m := regexp.MustCompile(`^class\s+(\w+)\s*\(.*[Mm]odel`).FindStringSubmatch(trimmed); m != nil {
+			if current != nil && len(current.Columns) > 0 {
+				tables = append(tables, *current)
+			}
+			current = &TableInfo{Name: m[1]}
+		} else if current != nil {
+			// field = models.CharField(...)
+			if m := regexp.MustCompile(`^\s+(\w+)\s*=\s*models\.(\w+)`).FindStringSubmatch(line); m != nil {
+				fieldName := m[1]
+				if fieldName != "Meta" && fieldName != "class" {
+					current.Columns = append(current.Columns, fieldName+" "+strings.ToLower(m[2]))
+				}
+			} else if trimmed != "" && !strings.HasPrefix(trimmed, "#") && !strings.HasPrefix(trimmed, "def ") {
+				if strings.HasPrefix(trimmed, "class ") {
+					// New class
+					if len(current.Columns) > 0 {
+						tables = append(tables, *current)
+					}
+					current = nil
+				}
+			}
+		}
+	}
+	if current != nil && len(current.Columns) > 0 {
+		tables = append(tables, *current)
+	}
+	return tables
+}
+
+
+=== FILE: internal/scanner/language.go ===
+package scanner
+
+import "strings"
+
+// DetectLanguage maps file extensions/names to language names
+func DetectLanguage(name, ext string) string {
+	nameMap := map[string]string{
+		"Makefile": "Makefile", "makefile": "Makefile",
+		"Dockerfile": "Dockerfile", "dockerfile": "Dockerfile",
+		"Jenkinsfile": "Groovy",
+		"Vagrantfile": "Ruby",
+		"Gemfile": "Ruby",
+		"Rakefile": "Ruby",
+		"go.mod": "Go Module", "go.sum": "Go Module",
+		"package.json": "JSON", "package-lock.json": "JSON",
+		"tsconfig.json": "JSON",
+		"requirements.txt": "Text", "requirements.in": "Text",
+		"pyproject.toml": "TOML",
+		"Cargo.toml": "TOML", "Cargo.lock": "TOML",
+		"composer.json": "JSON",
+		"pom.xml": "XML",
+		"build.gradle": "Groovy", "build.gradle.kts": "Kotlin",
+		".gitignore": "GitIgnore",
+		".editorconfig": "INI",
+		".env.example": "ENV",
+	}
+	if lang, ok := nameMap[name]; ok {
+		return lang
+	}
+
+	extMap := map[string]string{
+		".go": "Go",
+		".rs": "Rust",
+		".c": "C", ".h": "C",
+		".cpp": "C++", ".cc": "C++", ".cxx": "C++", ".hpp": "C++",
+		".cs": "C#",
+		".java": "Java",
+		".kt": "Kotlin", ".kts": "Kotlin",
+		".swift": "Swift",
+		".py": "Python",
+		".rb": "Ruby",
+		".php": "PHP",
+		".pl": "Perl",
+		".lua": "Lua",
+		".ex": "Elixir", ".exs": "Elixir",
+		".erl": "Erlang",
+		".hs": "Haskell",
+		".clj": "Clojure",
+		".scala": "Scala",
+		".groovy": "Groovy",
+		".js": "JavaScript", ".mjs": "JavaScript", ".cjs": "JavaScript",
+		".jsx": "JavaScript (JSX)",
+		".ts": "TypeScript", ".mts": "TypeScript",
+		".tsx": "TypeScript (TSX)",
+		".html": "HTML", ".htm": "HTML",
+		".css": "CSS",
+		".scss": "SCSS", ".sass": "SASS",
+		".less": "LESS",
+		".vue": "Vue",
+		".svelte": "Svelte",
+		".sh": "Shell", ".bash": "Shell", ".zsh": "Shell",
+		".ps1": "PowerShell",
+		".bat": "Batch", ".cmd": "Batch",
+		".json": "JSON",
+		".yaml": "YAML", ".yml": "YAML",
+		".toml": "TOML",
+		".xml": "XML",
+		".csv": "CSV",
+		".sql": "SQL",
+		".graphql": "GraphQL", ".gql": "GraphQL",
+		".proto": "Protobuf",
+		".md": "Markdown", ".mdx": "Markdown",
+		".rst": "reStructuredText",
+		".txt": "Text",
+		".ini": "INI", ".cfg": "INI", ".conf": "Config",
+		".env": "ENV",
+		".tf": "Terraform", ".tfvars": "Terraform",
+		".hcl": "HCL",
+		".tmpl": "Template", ".tpl": "Template",
+		".j2": "Jinja2",
+		".lock": "Lockfile",
+	}
+
+	if lang, ok := extMap[ext]; ok {
+		return lang
+	}
+	if ext != "" {
+		return strings.ToUpper(strings.TrimPrefix(ext, "."))
+	}
+	return "Unknown"
+}
+
+
+=== FILE: internal/scanner/scanner.go ===
+package scanner
+
+import (
+	"bufio"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"unicode"
+)
+
+// FileInfo holds metadata about a scanned file
+type FileInfo struct {
+	Path     string
+	RelPath  string
+	Size     int64
+	Language string
+	IsBinary bool
+}
+
+// Scanner walks a directory respecting ignore rules
+type Scanner struct {
+	Root        string
+	ignoreRules []ignoreRule
+}
+
+type ignoreRule struct {
+	pattern  string
+	negated  bool
+	dirOnly  bool
+	anchored bool
+}
+
+var defaultIgnoreDirs = map[string]bool{
+	"node_modules": true,
+	"dist":         true,
+	"build":        true,
+	".git":         true,
+	"target":       true,
+	"bin":          true,
+	"vendor":       true,
+	".cache":       true,
+	"__pycache__":  true,
+	".pytest_cache": true,
+	"coverage":     true,
+	".nyc_output":  true,
+	"out":          true,
+	".next":        true,
+	".nuxt":        true,
+	".svelte-kit":  true,
+	"venv":         true,
+	".venv":        true,
+	"env":          true,
+	".env":         true,
+	".tox":         true,
+	"htmlcov":      true,
+	".gradle":      true,
+	".mvn":         true,
+	"pkg":          true,
+	"obj":          true,
+	"Debug":        true,
+	"Release":      true,
+}
+
+var defaultIgnoreFiles = map[string]bool{
+	".DS_Store":      true,
+	"Thumbs.db":      true,
+	"desktop.ini":    true,
+	".gitkeep":       true,
+}
+
+var binaryExtensions = map[string]bool{
+	".png": true, ".jpg": true, ".jpeg": true, ".gif": true, ".bmp": true,
+	".ico": true, ".svg": false, // svg is text
+	".pdf": true, ".doc": true, ".docx": true, ".xls": true, ".xlsx": true,
+	".zip": true, ".tar": true, ".gz": true, ".bz2": true, ".7z": true, ".rar": true,
+	".exe": true, ".dll": true, ".so": true, ".dylib": true, ".a": true,
+	".bin": true, ".o": true, ".obj": true,
+	".woff": true, ".woff2": true, ".ttf": true, ".eot": true, ".otf": true,
+	".mp3": true, ".mp4": true, ".wav": true, ".avi": true, ".mov": true,
+	".sqlite": true, ".db": true,
+	".pyc": true, ".pyo": true, ".class": true,
+	".lock": false, // lock files are text
+}
+
+// New creates a Scanner for the given root directory
+func New(root string) (*Scanner, error) {
+	abs, err := filepath.Abs(root)
+	if err != nil {
+		return nil, err
+	}
+	s := &Scanner{Root: abs}
+	s.loadGitignore(abs)
+	return s, nil
+}
+
+func (s *Scanner) loadGitignore(dir string) {
+	path := filepath.Join(dir, ".gitignore")
+	f, err := os.Open(path)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		rule := ignoreRule{}
+		if strings.HasPrefix(line, "!") {
+			rule.negated = true
+			line = line[1:]
+		}
+		if strings.HasSuffix(line, "/") {
+			rule.dirOnly = true
+			line = strings.TrimSuffix(line, "/")
+		}
+		if strings.HasPrefix(line, "/") {
+			rule.anchored = true
+			line = line[1:]
+		}
+		rule.pattern = line
+		s.ignoreRules = append(s.ignoreRules, rule)
+	}
+}
+
+func (s *Scanner) isIgnoredByGitignore(relPath string, isDir bool) bool {
+	parts := strings.Split(relPath, string(os.PathSeparator))
+	name := parts[len(parts)-1]
+
+	for _, rule := range s.ignoreRules {
+		if rule.dirOnly && !isDir {
+			continue
+		}
+		matched := false
+		if rule.anchored {
+			matched, _ = filepath.Match(rule.pattern, relPath)
+			if !matched {
+				matched, _ = filepath.Match(rule.pattern, name)
+			}
+		} else {
+			// Check against each path component
+			for _, part := range parts {
+				m, _ := filepath.Match(rule.pattern, part)
+				if m {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				matched, _ = filepath.Match(rule.pattern, relPath)
+			}
+		}
+		if matched {
+			if rule.negated {
+				return false
+			}
+			return true
+		}
+	}
+	return false
+}
+
+// Walk traverses the directory and returns all relevant files
+func (s *Scanner) Walk() ([]FileInfo, error) {
+	var files []FileInfo
+
+	err := filepath.Walk(s.Root, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return nil // skip unreadable
+		}
+
+		relPath, _ := filepath.Rel(s.Root, path)
+		if relPath == "." {
+			return nil
+		}
+
+		name := info.Name()
+
+		// Skip hidden files/dirs (except important ones)
+		if strings.HasPrefix(name, ".") {
+			allowed := map[string]bool{
+				".gitignore": true, ".env.example": true, ".editorconfig": true,
+				".eslintrc": true, ".prettierrc": true, ".babelrc": true,
+			}
+			if !allowed[name] {
+				if info.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+		}
+
+		if info.IsDir() {
+			if defaultIgnoreDirs[name] {
+				return filepath.SkipDir
+			}
+			if s.isIgnoredByGitignore(relPath, true) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
+		// File checks
+		if defaultIgnoreFiles[name] {
+			return nil
+		}
+		if s.isIgnoredByGitignore(relPath, false) {
+			return nil
+		}
+
+		ext := strings.ToLower(filepath.Ext(name))
+		isBinary := false
+		if v, ok := binaryExtensions[ext]; ok {
+			isBinary = v
+		} else if ext == "" {
+			isBinary = isBinaryFile(path)
+		}
+
+		files = append(files, FileInfo{
+			Path:     path,
+			RelPath:  relPath,
+			Size:     info.Size(),
+			Language: DetectLanguage(name, ext),
+			IsBinary: isBinary,
+		})
+		return nil
+	})
+
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].RelPath < files[j].RelPath
+	})
+
+	return files, nil
+}
+
+func isBinaryFile(path string) bool {
+	f, err := os.Open(path)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+
+	buf := make([]byte, 512)
+	n, err := f.Read(buf)
+	if err != nil || n == 0 {
+		return false
+	}
+
+	for _, b := range buf[:n] {
+		if b == 0 {
+			return true
+		}
+		r := rune(b)
+		if b < 32 && !unicode.IsSpace(r) && b != 27 {
+			return true
+		}
+	}
+	return false
+}
+
+// ReadFile reads a text file's content
+func ReadFile(path string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+
+=== FILE: internal/writer/writer.go ===
+package writer
+
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/ctxgen/ctxgen/internal/analyzer"
+	"github.com/ctxgen/ctxgen/internal/parser"
+	"github.com/ctxgen/ctxgen/internal/scanner"
+)
+
+const tokensPerChar = 0.25 // rough approximation: ~4 chars per token
+
+// Options controls output behavior
+type Options struct {
+	OutputPath  string
+	Timestamp   bool
+	MaxFileSize int64  // skip files larger than this in bytes (0 = no limit)
+}
+
+// WritePack writes all file contents into a single text file
+func WritePack(files []scanner.FileInfo, contents map[string]string, opts Options) (string, error) {
+	outPath := opts.OutputPath
+	if outPath == "" {
+		outPath = "ctxgen-pack.txt"
+	}
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	var total int
+	for _, fi := range files {
+		if fi.IsBinary {
+			continue
+		}
+		content, ok := contents[fi.RelPath]
+		if !ok {
+			continue
+		}
+		fmt.Fprintf(f, "=== FILE: %s ===\n", fi.RelPath)
+		fmt.Fprintln(f, content)
+		fmt.Fprintln(f)
+		total++
+	}
+
+	absPath, _ := filepath.Abs(outPath)
+	return absPath, nil
+}
+
+// WriteContext writes the compact Markdown context file
+func WriteContext(ra *analyzer.RepoAnalysis, contents map[string]string, opts Options) (string, error) {
+	outPath := opts.OutputPath
+	if outPath == "" {
+		outPath = "ctxgen-context.md"
+	}
+
+	f, err := os.Create(outPath)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	w := &mdWriter{f: f}
+
+	w.h1("Project Context")
+
+	if opts.Timestamp {
+		w.line(fmt.Sprintf("> Generated: %s", time.Now().Format(time.RFC3339)))
+		w.nl()
+	}
+
+	// 1. Overview
+	w.h2("Overview")
+	langs := ra.TopLanguages()
+	frameworks := ra.DetectFrameworks()
+	if len(langs) > 0 {
+		primary := langs[0].Language
+		if len(langs) > 1 {
+			w.line(fmt.Sprintf("This repository is primarily **%s** with %d other languages.", primary, len(langs)-1))
+		} else {
+			w.line(fmt.Sprintf("This is a **%s** project.", primary))
+		}
+	}
+	if len(frameworks) > 0 {
+		w.line(fmt.Sprintf("Frameworks detected: %s.", strings.Join(frameworks, ", ")))
+	}
+	if len(ra.EntryPoints) > 0 {
+		w.line(fmt.Sprintf("Entry points: `%s`.", strings.Join(ra.EntryPoints, "`, `")))
+	}
+	w.nl()
+
+	// 2. File Tree
+	w.h2("File Tree")
+	w.code("", ra.FileTree)
+
+	// 3. Languages
+	w.h2("Languages")
+	for _, lc := range langs {
+		w.line(fmt.Sprintf("- **%s**: %d files", lc.Language, lc.Count))
+	}
+	w.nl()
+
+	// 4. Dependencies
+	if len(ra.Dependencies) > 0 {
+		w.h2("Dependencies")
+		// Group by source
+		bySource := make(map[string][]parser.Dependency)
+		for _, d := range ra.Dependencies {
+			bySource[d.Source] = append(bySource[d.Source], d)
+		}
+		sources := make([]string, 0, len(bySource))
+		for s := range bySource {
+			sources = append(sources, s)
+		}
+		sort.Strings(sources)
+
+		for _, src := range sources {
+			deps := bySource[src]
+			w.h3(src)
+			// Limit to 30 most important deps per source
+			if len(deps) > 30 {
+				deps = deps[:30]
+			}
+			for _, d := range deps {
+				if d.Version != "" {
+					w.line(fmt.Sprintf("- `%s` %s", d.Name, d.Version))
+				} else {
+					w.line(fmt.Sprintf("- `%s`", d.Name))
+				}
+			}
+			w.nl()
+		}
+	}
+
+	// 5. Entry Points
+	if len(ra.EntryPoints) > 0 {
+		w.h2("Entry Points")
+		for _, ep := range ra.EntryPoints {
+			w.line(fmt.Sprintf("- `%s`", ep))
+		}
+		w.nl()
+	}
+
+	// 6. Configuration Files
+	if len(ra.ConfigFiles) > 0 {
+		w.h2("Configuration Files")
+		for _, cf := range ra.ConfigFiles {
+			w.line(fmt.Sprintf("- `%s`", cf))
+		}
+		w.nl()
+	}
+
+	// 7. Core Modules
+	w.h2("Core Modules")
+	symbolCount := 0
+	for _, mod := range ra.Modules {
+		if len(mod.Files) == 0 {
+			continue
+		}
+		// Only show modules with actual symbols
+		totalSymbols := 0
+		for _, mf := range mod.Files {
+			totalSymbols += len(mf.Symbols)
+		}
+		if totalSymbols == 0 && !mod.IsEntry {
+			continue
+		}
+
+		modTitle := mod.Path
+		if modTitle == "/" || modTitle == "." {
+			modTitle = "(root)"
+		}
+		w.h3(modTitle)
+
+		for _, mf := range mod.Files {
+			if len(mf.Symbols) == 0 && mf.Summary == "" {
+				continue
+			}
+			w.line(fmt.Sprintf("**`%s`** (%s)", mf.RelPath, mf.Language))
+			if mf.Summary != "" {
+				w.line(fmt.Sprintf("  > %s", mf.Summary))
+			}
+			if len(mf.Symbols) > 0 {
+				// Group by kind
+				byKind := make(map[string][]string)
+				for _, sym := range mf.Symbols {
+					name := sym.Name
+					if sym.Sig != "" && sym.Kind == "func" || sym.Kind == "method" {
+						name = name + sym.Sig
+					}
+					byKind[sym.Kind] = append(byKind[sym.Kind], name)
+					symbolCount++
+				}
+				for _, kind := range []string{"struct", "class", "interface", "trait", "enum", "type", "func", "method", "module", "const"} {
+					names := byKind[kind]
+					if len(names) == 0 {
+						continue
+					}
+					if len(names) > 15 {
+						names = names[:15]
+					}
+					w.line(fmt.Sprintf("  - *%ss*: `%s`", kind, strings.Join(names, "`, `")))
+				}
+			}
+			w.nl()
+		}
+	}
+
+	// 8. API Routes
+	if len(ra.AllRoutes) > 0 {
+		w.h2("API Routes")
+		// Deduplicate routes
+		seen := make(map[string]bool)
+		for _, r := range ra.AllRoutes {
+			key := r.Method + " " + r.Path
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+			w.line(fmt.Sprintf("- `%s %s` — `%s`", r.Method, r.Path, r.File))
+		}
+		w.nl()
+	}
+
+	// 9. Database Schema
+	if len(ra.AllSchemas) > 0 {
+		w.h2("Database Schema")
+		for _, schema := range ra.AllSchemas {
+			if len(schema.Tables) == 0 {
+				continue
+			}
+			w.h3(schema.Source)
+			for _, table := range schema.Tables {
+				if len(table.Columns) > 0 {
+					cols := table.Columns
+					if len(cols) > 10 {
+						cols = append(cols[:10], "...")
+					}
+					w.line(fmt.Sprintf("- **%s** (%s)", table.Name, strings.Join(cols, ", ")))
+				} else {
+					w.line(fmt.Sprintf("- **%s**", table.Name))
+				}
+			}
+			w.nl()
+		}
+	}
+
+	// 10. Import Graph (top-level only)
+	if len(ra.ImportGraph) > 0 {
+		w.h2("Import Relationships")
+		w.line("Key module dependencies (top-level files):")
+		w.nl()
+		keys := make([]string, 0, len(ra.ImportGraph))
+		for k := range ra.ImportGraph {
+			if strings.Count(k, string(filepath.Separator)) <= 2 {
+				keys = append(keys, k)
+			}
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			imports := ra.ImportGraph[k]
+			// Filter to local/project imports only
+			var local []string
+			for _, imp := range imports {
+				if !strings.Contains(imp, ".") || strings.HasPrefix(imp, ".") || strings.HasPrefix(imp, "..") {
+					local = append(local, "`"+imp+"`")
+				}
+			}
+			if len(local) > 0 {
+				if len(local) > 8 {
+					local = local[:8]
+				}
+				w.line(fmt.Sprintf("- `%s` → %s", k, strings.Join(local, ", ")))
+			}
+		}
+		w.nl()
+	}
+
+	// 11. Notes on ignored/binary files
+	if ra.IgnoredCount > 0 {
+		w.h2("Notes")
+		w.line(fmt.Sprintf("- %d binary/non-text files were excluded from analysis.", ra.IgnoredCount))
+		w.nl()
+	}
+
+	// 12. Token estimate
+	w.h2("Token Estimate")
+	outputStat, _ := f.Stat()
+	outputSize := int64(0)
+	if outputStat != nil {
+		outputSize = outputStat.Size()
+	}
+	origTokens := int(float64(ra.TotalChars) * tokensPerChar)
+	outTokens := int(float64(outputSize) * tokensPerChar)
+	reduction := 0.0
+	if origTokens > 0 {
+		reduction = float64(origTokens-outTokens) / float64(origTokens) * 100
+	}
+	w.code("", fmt.Sprintf(
+		"Files processed:  %d\nTotal source size: %s\nOriginal estimate: ~%s tokens\nContext output:   ~%s tokens\nEstimated reduction: %.1f%%",
+		len(ra.Files),
+		humanSize(ra.TotalSize),
+		humanNum(origTokens),
+		humanNum(outTokens),
+		reduction,
+	))
+
+	absPath, _ := filepath.Abs(outPath)
+	return absPath, nil
+}
+
+// WriteHybrid writes context + full content of important files
+func WriteHybrid(ra *analyzer.RepoAnalysis, contents map[string]string, opts Options) (string, error) {
+	outPath := opts.OutputPath
+	if outPath == "" {
+		outPath = "ctxgen-hybrid.md"
+	}
+
+	// First write context
+	tmpOpts := opts
+	tmpOpts.OutputPath = outPath
+	path, err := WriteContext(ra, contents, tmpOpts)
+	if err != nil {
+		return "", err
+	}
+
+	// Append important files
+	f, err := os.OpenFile(outPath, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+
+	w := &mdWriter{f: f}
+	important := ra.ImportantFiles()
+
+	if len(important) > 0 {
+		w.h2("Important File Contents")
+		w.line(fmt.Sprintf("*Full contents of %d key files:*", len(important)))
+		w.nl()
+
+		for _, fi := range important {
+			content, ok := contents[fi.RelPath]
+			if !ok || content == "" {
+				continue
+			}
+			// Skip very large files
+			if opts.MaxFileSize > 0 && fi.Size > opts.MaxFileSize {
+				w.line(fmt.Sprintf("*`%s` — skipped (too large: %s)*", fi.RelPath, humanSize(fi.Size)))
+				w.nl()
+				continue
+			}
+
+			w.h3(fi.RelPath)
+			lang := strings.ToLower(fi.Language)
+			// Normalize lang for code fence
+			langMap := map[string]string{
+				"go": "go", "python": "python", "javascript": "javascript",
+				"typescript": "typescript", "rust": "rust", "java": "java",
+				"c#": "csharp", "c++": "cpp", "c": "c", "ruby": "ruby",
+				"shell": "bash", "yaml": "yaml", "json": "json",
+				"markdown": "markdown", "sql": "sql", "toml": "toml",
+			}
+			fence := langMap[lang]
+			w.code(fence, content)
+		}
+	}
+
+	return path, nil
+}
+
+// --- Markdown writer helper ---
+
+type mdWriter struct {
+	f *os.File
+}
+
+func (w *mdWriter) write(s string) {
+	w.f.WriteString(s)
+}
+
+func (w *mdWriter) line(s string) {
+	w.f.WriteString(s + "\n")
+}
+
+func (w *mdWriter) nl() {
+	w.f.WriteString("\n")
+}
+
+func (w *mdWriter) h1(s string) {
+	w.f.WriteString("# " + s + "\n\n")
+}
+
+func (w *mdWriter) h2(s string) {
+	w.f.WriteString("\n## " + s + "\n\n")
+}
+
+func (w *mdWriter) h3(s string) {
+	w.f.WriteString("### " + s + "\n\n")
+}
+
+func (w *mdWriter) code(lang, content string) {
+	w.f.WriteString("```" + lang + "\n")
+	w.f.WriteString(content)
+	if !strings.HasSuffix(content, "\n") {
+		w.f.WriteString("\n")
+	}
+	w.f.WriteString("```\n\n")
+}
+
+// --- Utilities ---
+
+func humanSize(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func humanNum(n int) string {
+	if n < 1000 {
+		return fmt.Sprintf("%d", n)
+	}
+	if n < 1000000 {
+		return fmt.Sprintf("%dk", n/1000)
+	}
+	return fmt.Sprintf("%.1fM", float64(n)/1000000)
+}
+
+// EstimateTokens returns a rough token count for a string
+func EstimateTokens(s string) int {
+	charCount := utf8.RuneCountInString(s)
+	return int(float64(charCount) * tokensPerChar)
+}
+
+
