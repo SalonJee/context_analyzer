@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+	"os/exec"
+    "runtime"
 
 	"github.com/ctxgen/ctxgen/internal/analyzer"
 	"github.com/ctxgen/ctxgen/internal/scanner"
@@ -92,6 +94,7 @@ func main() {
 	outputPath := fs.String("o", "", "Output file path")
 	timestamp := fs.Bool("t", false, "Include timestamp in output")
 	maxSize := fs.Int64("max-size", 500000, "Maximum file size in bytes")
+	copyClip := fs.Bool("copy", false, "Copy output to clipboard after writing")
 	_ = fs.Bool("v", false, "Show version") // consumed above
 
 	fs.Usage = func() { fmt.Fprint(os.Stderr, usage) }
@@ -210,6 +213,17 @@ if resolvedOutput == "" {
 		outputSize = outputInfo.Size()
 	}
 
+	if *copyClip {
+    content, err := os.ReadFile(outPath)
+    if err == nil {
+        if err := copyToClipboard(string(content)); err != nil {
+            fmt.Fprintf(os.Stderr, "Warning: could not copy to clipboard: %v\n", err)
+        } else {
+            fmt.Fprintln(os.Stderr, "✓ Copied to clipboard")
+        }
+    }
+}
+
 	fmt.Fprintln(os.Stderr, strings.Repeat("─", 50))
 	fmt.Fprintf(os.Stderr, "✓ Done in %s\n", elapsed)
 	fmt.Fprintf(os.Stderr, "  Output:  %s\n", outPath)
@@ -228,4 +242,20 @@ func humanSize(bytes int64) string {
 		exp++
 	}
 	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
+
+func copyToClipboard(text string) error {
+	var cmd *exec.Cmd
+	switch runtime.GOOS {
+	case "linux":
+		cmd = exec.Command("xclip", "-selection", "clipboard")
+	case "darwin":
+		cmd = exec.Command("pbcopy")
+	case "windows":
+		cmd = exec.Command("clip")
+	default:
+		return fmt.Errorf("clipboard not supported on %s", runtime.GOOS)
+	}
+	cmd.Stdin = strings.NewReader(text)
+	return cmd.Run()
 }
